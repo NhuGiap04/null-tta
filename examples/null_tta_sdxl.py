@@ -182,9 +182,9 @@ class MockReward:
     def eval(self):
         pass
 
-def get_pickscore_fn(target_name):
+def get_pickscore_fn(target_name, force_load=False):
     # ✨ Memory optimization: do not load unless it's the target
-    if target_name != "pickscore":
+    if not force_load and target_name != "pickscore":
         return MockReward()
 
     try:
@@ -197,8 +197,8 @@ def get_pickscore_fn(target_name):
         return MockReward()
 
 
-def get_aesthetic_fn(target_name):
-    if target_name != "aesthetic":
+def get_aesthetic_fn(target_name, force_load=False):
+    if not force_load and target_name != "aesthetic":
         return MockReward()
 
     try:
@@ -211,8 +211,8 @@ def get_aesthetic_fn(target_name):
         return MockReward()
 
 
-def get_hps_fn(target_name):
-    if target_name != "hpsv2":
+def get_hps_fn(target_name, force_load=False):
+    if not force_load and target_name != "hpsv2":
         return MockReward()
 
     try:
@@ -225,8 +225,8 @@ def get_hps_fn(target_name):
         return MockReward()
 
 
-def get_imagereward_fn(target_name):
-    if target_name != "imagereward":
+def get_imagereward_fn(target_name, force_load=False):
+    if not force_load and target_name != "imagereward":
         return MockReward()
 
     try:
@@ -636,6 +636,7 @@ def main():
     parser.add_argument("--num_particles", type=int)
     parser.add_argument("--lr_uncond", type=float)
     parser.add_argument("--tampering_coef", type=float)
+    parser.add_argument("--eval_all_rewards", action="store_true")
     args = parser.parse_args()
 
     # Update globals
@@ -671,16 +672,16 @@ def main():
     # ✨ Enable UNet checkpointing (memory saving)
     pipe.unet.enable_gradient_checkpointing()
 
-    # ✨ Target reward only loading
-    pickscore_fn = get_pickscore_fn(args.target_reward)
-    aesthetic_fn = get_aesthetic_fn(args.target_reward)
-    hps_fn = get_hps_fn(args.target_reward)
-    imagereward_fn = get_imagereward_fn(args.target_reward)
+    # ✨ Target reward only loading; optionally load all for evaluation
+    pickscore_fn = get_pickscore_fn(args.target_reward, force_load=args.eval_all_rewards)
+    aesthetic_fn = get_aesthetic_fn(args.target_reward, force_load=args.eval_all_rewards)
+    hps_fn = get_hps_fn(args.target_reward, force_load=args.eval_all_rewards)
+    imagereward_fn = get_imagereward_fn(args.target_reward, force_load=args.eval_all_rewards)
 
-    if args.target_reward == "pickscore": target_fn = pickscore_fn
-    elif args.target_reward == "aesthetic": target_fn = aesthetic_fn
-    elif args.target_reward == "hpsv2": target_fn = hps_fn
-    elif args.target_reward == "imagereward": target_fn = imagereward_fn
+    if args.target_reward == "pickscore": target_fn = get_pickscore_fn(args.target_reward)
+    elif args.target_reward == "aesthetic": target_fn = get_aesthetic_fn(args.target_reward)
+    elif args.target_reward == "hpsv2": target_fn = get_hps_fn(args.target_reward)
+    elif args.target_reward == "imagereward": target_fn = get_imagereward_fn(args.target_reward)
     else: target_fn = MockReward()
 
     for a, b, g in hp_triples:

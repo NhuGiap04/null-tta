@@ -149,8 +149,21 @@ def tweedie_x0_from_eps(x_t: torch.Tensor, eps: torch.Tensor, alpha_t: torch.Ten
 
 # --- reward loaders ---
 
-def get_reward_fn():
+class MockRewardNaN:
+    def __call__(self, images, prompts):
+        if isinstance(prompts, str):
+            prompts = [prompts] * images.shape[0]
+        return torch.tensor([float('nan')] * images.shape[0], device=images.device)
+
+    def eval(self):
+        pass
+
+
+def get_reward_fn(target_name, force_load=False):
     """PickScore (default optimization target)"""
+    if not force_load and target_name != "pickscore":
+        return MockRewardNaN()
+
     try:
         import das.rewards as rewards
         reward_model = rewards.PickScore(device=device)
@@ -172,7 +185,10 @@ def get_reward_fn():
         return MockReward()
 
 
-def get_aesthetic_fn():
+def get_aesthetic_fn(target_name, force_load=False):
+    if not force_load and target_name != "aesthetic":
+        return MockRewardNaN()
+
     try:
         import das.rewards as rewards
         reward_model = rewards.aesthetic_score(device=device)
@@ -194,7 +210,10 @@ def get_aesthetic_fn():
         return MockAesthetic()
 
 
-def get_hps_fn():
+def get_hps_fn(target_name, force_load=False):
+    if not force_load and target_name != "hpsv2":
+        return MockRewardNaN()
+
     try:
         import das.rewards as rewards
         reward_model = rewards.hps_score(device=device)
@@ -216,7 +235,10 @@ def get_hps_fn():
         return MockHPS()
 
 
-def get_imagereward_fn():
+def get_imagereward_fn(target_name, force_load=False):
+    if not force_load and target_name != "imagereward":
+        return MockRewardNaN()
+
     try:
         import das.rewards as rewards
         reward_model = rewards.ImageReward(device=device)
@@ -867,6 +889,7 @@ def main():
         type=float,
         help="Tampering coefficient used in (1 + tampering_coef)**i (default: 0.008)",
     )
+    parser.add_argument("--eval_all_rewards", action="store_true")
 
     args = parser.parse_args()
 
@@ -944,10 +967,10 @@ def main():
                 "cannot proceed with v5.6/v15 formula."
             )
 
-    pickscore_fn = get_reward_fn()
-    aesthetic_fn = get_aesthetic_fn()
-    hps_fn = get_hps_fn()
-    imagereward_fn = get_imagereward_fn()
+    pickscore_fn = get_reward_fn(args.target_reward, force_load=args.eval_all_rewards)
+    aesthetic_fn = get_aesthetic_fn(args.target_reward, force_load=args.eval_all_rewards)
+    hps_fn = get_hps_fn(args.target_reward, force_load=args.eval_all_rewards)
+    imagereward_fn = get_imagereward_fn(args.target_reward, force_load=args.eval_all_rewards)
 
     # Select target reward
     if args.target_reward == "pickscore":
