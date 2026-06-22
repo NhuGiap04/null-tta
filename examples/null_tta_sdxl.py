@@ -98,7 +98,8 @@ DEFAULT_HYPERPARAM_TRIPLES = [
 ]
 
 base_log_dir_root_template = (
-    "logs_sdxl/SDXL_NullTTA_particle_{num_particles}_tampering_steps_"
+    "/content/drive/MyDrive/Crunchylab/01_Evolve_Steering/Text2Img/"
+    "baselines/Nulltext_Embedding/logs_sdxl/SDXL_NullTTA_particle_{num_particles}_tampering_steps_"
     "{min_inner_steps}_to_{max_inner_steps}_{seed}_target-{target}"
 )
 
