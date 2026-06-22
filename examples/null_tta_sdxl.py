@@ -226,6 +226,20 @@ def get_hps_fn(target_name, force_load=False):
         return MockReward()
 
 
+def get_clip_fn(force_load=False):
+    if not force_load:
+        return MockReward()
+
+    try:
+        import das.rewards as rewards
+        reward_model = rewards.clip_score(device=device)
+        print("Using CLIP score reward (for logging).")
+        return reward_model
+    except Exception as e:
+        print(f"Could not import das.rewards or load CLIP score: {e}")
+        return MockReward()
+
+
 def get_imagereward_fn(target_name, force_load=False):
     if not force_load and target_name != "imagereward":
         return MockReward()
@@ -571,7 +585,7 @@ class CFGOptWithBeamSearch:
 # =========================
 def run_single_experiment(
     lambda_alpha, lambda_beta, lambda_gamma, num_particles, log_dir, pipe,
-    target_reward_fn, pickscore_fn, aesthetic_fn, hps_fn, imagereward_fn,
+    target_reward_fn, pickscore_fn, aesthetic_fn, hps_fn, clip_fn, imagereward_fn,
     base_tensors_batch, current_seed, current_prompt, current_negative_prompt,
     min_inner_steps, max_inner_steps, target_reward_name, tampering_coef,
     # ✨ SDXL embeddings passed explicitly
@@ -589,8 +603,9 @@ def run_single_experiment(
         s_pick = float(pickscore_fn(img_batch, prompts).mean().item())
         s_aes = float(aesthetic_fn(img_batch, prompts).mean().item())
         s_hps = float(hps_fn(img_batch, prompts).mean().item())
+        s_clip = float(clip_fn(img_batch, prompts).mean().item())
         s_ir = float(imagereward_fn(img_batch, prompts).mean().item())
-        print(f"Baseline: Pick={s_pick:.3f}, Aes={s_aes:.3f}, HPS={s_hps:.3f}, IR={s_ir:.3f}")
+        print(f"Baseline: Pick={s_pick:.3f}, Aes={s_aes:.3f}, HPS={s_hps:.3f}, CLIP={s_clip:.3f}, IR={s_ir:.3f}")
 
     runner = CFGOptWithBeamSearch(
         pipe, guidance_scale, num_inference_steps, lr_uncond,
@@ -614,10 +629,11 @@ def run_single_experiment(
         o_pick = float(pickscore_fn(best_img, prompts).mean().item())
         o_aes = float(aesthetic_fn(best_img, prompts).mean().item())
         o_hps = float(hps_fn(best_img, prompts).mean().item())
+        o_clip = float(clip_fn(best_img, prompts).mean().item())
         o_ir = float(imagereward_fn(best_img, prompts).mean().item())
-        print(f"Optimized: Pick={o_pick:.3f}, Aes={o_aes:.3f}, HPS={o_hps:.3f}, IR={o_ir:.3f}")
+        print(f"Optimized: Pick={o_pick:.3f}, Aes={o_aes:.3f}, HPS={o_hps:.3f}, CLIP={o_clip:.3f}, IR={o_ir:.3f}")
 
-    return (base_img, best_img.squeeze(0), s_pick, o_pick, s_aes, o_aes, s_hps, o_hps, s_ir, o_ir)
+    return (base_img, best_img.squeeze(0), s_pick, o_pick, s_aes, o_aes, s_hps, o_hps, s_clip, o_clip, s_ir, o_ir)
 
 
 # =========================
@@ -677,6 +693,7 @@ def main():
     pickscore_fn = get_pickscore_fn(args.target_reward, force_load=args.eval_all_rewards)
     aesthetic_fn = get_aesthetic_fn(args.target_reward, force_load=args.eval_all_rewards)
     hps_fn = get_hps_fn(args.target_reward, force_load=args.eval_all_rewards)
+    clip_fn = get_clip_fn(force_load=args.eval_all_rewards)
     imagereward_fn = get_imagereward_fn(args.target_reward, force_load=args.eval_all_rewards)
 
     if args.target_reward == "pickscore": target_fn = get_pickscore_fn(args.target_reward)
@@ -691,7 +708,7 @@ def main():
         
         with open(os.path.join(log_dir, "results.csv"), "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["prompt", "base_pick", "opt_pick", "base_aes", "opt_aes", "base_hps", "opt_hps", "base_ir", "opt_ir"])
+            writer.writerow(["prompt", "base_pick", "opt_pick", "base_aes", "opt_aes", "base_hps", "opt_hps", "base_clip", "opt_clip", "base_ir", "opt_ir"])
 
             for idx, prompt in enumerate(prompt_list):
                 print(f"\nPrompt {idx}: {prompt[:50]}...")
@@ -736,12 +753,12 @@ def main():
 
                 res = run_single_experiment(
                     a, b, g, num_particles, log_dir, pipe,
-                    target_fn, pickscore_fn, aesthetic_fn, hps_fn, imagereward_fn,
+                    target_fn, pickscore_fn, aesthetic_fn, hps_fn, clip_fn, imagereward_fn,
                     base_batch, seed, prompt, negative_prompt, min_inner_steps, max_inner_steps, args.target_reward, tampering_coef,
                     p_emb, n_p_emb, pool_p_emb, n_pool_p_emb, add_time_ids, n_add_time_ids
                 )
                 
-                writer.writerow([prompt, res[2], res[3], res[4], res[5], res[6], res[7], res[8], res[9]])
+                writer.writerow([prompt, res[2], res[3], res[4], res[5], res[6], res[7], res[8], res[9], res[10], res[11]])
                 
                 opt_img_path = os.path.join(log_dir, f"{idx}_opt.png")
                 save_image_tensor(res[1], opt_img_path)

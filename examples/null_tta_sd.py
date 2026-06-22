@@ -236,6 +236,20 @@ def get_hps_fn(target_name, force_load=False):
         return MockHPS()
 
 
+def get_clip_fn(force_load=False):
+    if not force_load:
+        return MockRewardNaN()
+
+    try:
+        import das.rewards as rewards
+        reward_model = rewards.clip_score(device=device)
+        print("Using CLIP score reward (for logging).")
+        return reward_model
+    except Exception as e:
+        print(f"Could not import das.rewards or load CLIP score: {e}")
+        return MockRewardNaN()
+
+
 def get_imagereward_fn(target_name, force_load=False):
     if not force_load and target_name != "imagereward":
         return MockRewardNaN()
@@ -694,6 +708,7 @@ def run_single_experiment(
     pickscore_fn,
     aesthetic_fn,
     hps_fn,
+    clip_fn,
     imagereward_fn,
     base_tensors_batch,
     current_seed: int,
@@ -721,6 +736,7 @@ def run_single_experiment(
             score_base_pick = float(pickscore_fn(base_img.unsqueeze(0), prompt_list_base).mean().item())
             score_base_aesthetic = float(aesthetic_fn(base_img.unsqueeze(0), prompt_list_base).mean().item())
             score_base_hps = float(hps_fn(base_img.unsqueeze(0), prompt_list_base).mean().item())
+            score_base_clip = float(clip_fn(base_img.unsqueeze(0), prompt_list_base).mean().item())
             score_base_imagereward = float(
                 imagereward_fn(base_img.unsqueeze(0), prompt_list_base).mean().item()
             )
@@ -729,6 +745,7 @@ def run_single_experiment(
                 f"  Baseline Scores: Pick={score_base_pick:.4f},"
                 f" Aes={score_base_aesthetic:.4f},"
                 f" HPS={score_base_hps:.4f},"
+                f" CLIP={score_base_clip:.4f},"
                 f" IR={score_base_imagereward:.4f}"
             )
         except Exception as e:
@@ -736,6 +753,7 @@ def run_single_experiment(
             score_base_pick = float("nan")
             score_base_aesthetic = float("nan")
             score_base_hps = float("nan")
+            score_base_clip = float("nan")
             score_base_imagereward = float("nan")
 
     runner = CFGOptWithBeamSearch(
@@ -752,7 +770,7 @@ def run_single_experiment(
         tampering_coef=tampering_coef,
     )
 
-    for fn in [target_reward_fn, pickscore_fn, aesthetic_fn, hps_fn, imagereward_fn]:
+    for fn in [target_reward_fn, pickscore_fn, aesthetic_fn, hps_fn, clip_fn, imagereward_fn]:
         if hasattr(fn, "eval"):
             fn.eval()
 
@@ -766,6 +784,7 @@ def run_single_experiment(
     score_opt_pick = -float("inf")
     score_opt_aesthetic = float("nan")
     score_opt_hps = float("nan")
+    score_opt_clip = float("nan")
     score_opt_imagereward = float("nan")
 
     try:
@@ -795,6 +814,11 @@ def run_single_experiment(
             if np.isnan(score_opt_hps):
                 score_opt_hps = float("nan")
 
+            scores_opt_clip_batch = clip_fn(img_opt_batch, prompt_list_opt)
+            score_opt_clip = float(scores_opt_clip_batch[0].item())
+            if np.isnan(score_opt_clip):
+                score_opt_clip = float("nan")
+
             scores_opt_imagereward_batch = imagereward_fn(img_opt_batch, prompt_list_opt)
             score_opt_imagereward = float(scores_opt_imagereward_batch[0].item())
             if np.isnan(score_opt_imagereward):
@@ -806,6 +830,7 @@ def run_single_experiment(
             f"Final optimized scores: Pick={score_opt_pick:.4f},"
             f" Aes={score_opt_aesthetic:.4f},"
             f" HPS={score_opt_hps:.4f},"
+            f" CLIP={score_opt_clip:.4f},"
             f" IR={score_opt_imagereward:.4f}"
         )
 
@@ -816,6 +841,7 @@ def run_single_experiment(
         score_opt_pick = -float("inf")
         score_opt_aesthetic = float("nan")
         score_opt_hps = float("nan")
+        score_opt_clip = float("nan")
         score_opt_imagereward = float("nan")
         best_img = base_img  # fallback
 
@@ -830,6 +856,8 @@ def run_single_experiment(
         score_opt_aesthetic,
         score_base_hps,
         score_opt_hps,
+        score_base_clip,
+        score_opt_clip,
         score_base_imagereward,
         score_opt_imagereward,
     )
@@ -971,6 +999,7 @@ def main():
     pickscore_fn = get_reward_fn(args.target_reward, force_load=args.eval_all_rewards)
     aesthetic_fn = get_aesthetic_fn(args.target_reward, force_load=args.eval_all_rewards)
     hps_fn = get_hps_fn(args.target_reward, force_load=args.eval_all_rewards)
+    clip_fn = get_clip_fn(force_load=args.eval_all_rewards)
     imagereward_fn = get_imagereward_fn(args.target_reward, force_load=args.eval_all_rewards)
 
     # Select target reward
@@ -1029,6 +1058,8 @@ def main():
                     "optimized_aes",
                     "baseline_hps",
                     "optimized_hps",
+                    "baseline_clip",
+                    "optimized_clip",
                     "baseline_ir",
                     "optimized_ir",
                 ]
@@ -1073,6 +1104,8 @@ def main():
                     best_opt_aes_score,
                     base_score_hps,
                     best_opt_hps_score,
+                    base_score_clip,
+                    best_opt_clip_score,
                     base_score_ir,
                     best_opt_ir_score,
                 ) = run_single_experiment(
@@ -1086,6 +1119,7 @@ def main():
                     pickscore_fn=pickscore_fn,
                     aesthetic_fn=aesthetic_fn,
                     hps_fn=hps_fn,
+                    clip_fn=clip_fn,
                     imagereward_fn=imagereward_fn,
                     base_tensors_batch=base_tensors_batch,
                     current_seed=seed,
@@ -1119,6 +1153,8 @@ def main():
                         best_opt_aes_score,
                         base_score_hps,
                         best_opt_hps_score,
+                        base_score_clip,
+                        best_opt_clip_score,
                         base_score_ir,
                         best_opt_ir_score,
                     ]
@@ -1132,6 +1168,8 @@ def main():
                         "opt_aes": best_opt_aes_score,
                         "base_hps": base_score_hps,
                         "opt_hps": best_opt_hps_score,
+                        "base_clip": base_score_clip,
+                        "opt_clip": best_opt_clip_score,
                         "base_ir": base_score_ir,
                         "opt_ir": best_opt_ir_score,
                         "prompt": current_prompt,
@@ -1160,6 +1198,12 @@ def main():
             )
             avg_opt_hps = safe_mean(
                 [r["opt_hps"] for r in current_pair_prompt_results]
+            )
+            avg_base_clip = safe_mean(
+                [r["base_clip"] for r in current_pair_prompt_results]
+            )
+            avg_opt_clip = safe_mean(
+                [r["opt_clip"] for r in current_pair_prompt_results]
             )
             avg_base_ir = safe_mean(
                 [r["base_ir"] for r in current_pair_prompt_results]
@@ -1196,6 +1240,8 @@ def main():
                     avg_opt_aes,
                     avg_base_hps,
                     avg_opt_hps,
+                    avg_base_clip,
+                    avg_opt_clip,
                     avg_base_ir,
                     avg_opt_ir,
                 ]
@@ -1212,6 +1258,7 @@ def main():
         )
         print(f"*** (PickScore)  Base: {avg_base_pick:.4f}, Opt: {avg_opt_pick:.4f}")
         print(f"*** (HPSv2)      Base: {avg_base_hps:.4f}, Opt: {avg_opt_hps:.4f}")
+        print(f"*** (CLIPScore)   Base: {avg_base_clip:.4f}, Opt: {avg_opt_clip:.4f}")
         print(f"*** (Aesthetic)  Base: {avg_base_aes:.4f}, Opt: {avg_opt_aes:.4f}")
         print(f"*** (ImageRwrd)  Base: {avg_base_ir:.4f}, Opt: {avg_opt_ir:.4f}")
         print(
@@ -1234,6 +1281,8 @@ def main():
                 "avg_optimized_aesthetic_score": avg_opt_aes,
                 "avg_baseline_hps_score": avg_base_hps,
                 "avg_optimized_hps_score": avg_opt_hps,
+                "avg_baseline_clip_score": avg_base_clip,
+                "avg_optimized_clip_score": avg_opt_clip,
                 "avg_baseline_imagereward_score": avg_base_ir,
                 "avg_optimized_imagereward_score": avg_opt_ir,
                 "avg_target_baseline": target_base_avg,
@@ -1269,6 +1318,7 @@ def main():
         opt_pick_str = f"{result['avg_optimized_pickscore']:.4f}"
         opt_aes_str = f"{result['avg_optimized_aesthetic_score']:.4f}"
         opt_hps_str = f"{result['avg_optimized_hps_score']:.4f}"
+        opt_clip_str = f"{result['avg_optimized_clip_score']:.4f}"
         opt_ir_str = f"{result['avg_optimized_imagereward_score']:.4f}"
 
         print(
@@ -1279,7 +1329,8 @@ def main():
         )
         print(
             f"     -> Opt Scores (Pick: {opt_pick_str:<10} | "
-            f"Aes: {opt_aes_str:<10} | HPS: {opt_hps_str:<10} | IR: {opt_ir_str:<10})"
+            f"Aes: {opt_aes_str:<10} | HPS: {opt_hps_str:<10} | "
+            f"CLIP: {opt_clip_str:<10} | IR: {opt_ir_str:<10})"
         )
 
     summary_path = os.path.join(
@@ -1303,6 +1354,8 @@ def main():
             "avg_optimized_aesthetic_score",
             "avg_baseline_hps_score",
             "avg_optimized_hps_score",
+            "avg_baseline_clip_score",
+            "avg_optimized_clip_score",
             "avg_baseline_imagereward_score",
             "avg_optimized_imagereward_score",
             "avg_target_baseline",
