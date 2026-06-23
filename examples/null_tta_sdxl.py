@@ -85,7 +85,7 @@ negative_prompt = "blurry, ugly, duplicate, poorly drawn, deformed, low quality,
 
 num_samples = 3
 num_particles = 3
-num_inference_steps = 100 
+num_inference_steps = 50 
 guidance_scale = 5.0      # ✨ SDXL: 7.5 -> 5.0
 
 min_inner_steps = 5
