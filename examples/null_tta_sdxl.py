@@ -85,6 +85,7 @@ negative_prompt = "blurry, ugly, duplicate, poorly drawn, deformed, low quality,
 
 num_samples = 3
 num_particles = 3
+batch_p = None
 num_inference_steps = 50 
 guidance_scale = 5.0      # ✨ SDXL: 7.5 -> 5.0
 
@@ -284,6 +285,7 @@ class CFGOptWithBeamSearch:
         lambda_beta: float,
         lambda_gamma: float,
         num_beams: int,
+        batch_p: int = None,
         tampering_coef: float = 0.008,
     ):
         self.pipe = pipe
@@ -296,6 +298,11 @@ class CFGOptWithBeamSearch:
         self.lambda_reg = float(lambda_beta)
         self.phi_variance = float(lambda_gamma)
         self.K_samples = int(num_beams)
+        self.batch_p = self.K_samples if batch_p is None else int(batch_p)
+        if self.batch_p < 1:
+            raise ValueError("batch_p must be >= 1")
+        if self.batch_p > self.K_samples:
+            raise ValueError("batch_p must be <= num_particles")
         self.tampering_coef = float(tampering_coef)
 
         # Freeze all models
@@ -368,45 +375,57 @@ class CFGOptWithBeamSearch:
             return noise_pred_tuple[0]
         # ---------------------------------
 
+        def particle_slices(total: int):
+            for start in range(0, total, self.batch_p):
+                end = min(start + self.batch_p, total)
+                yield start, end
+
         # initial selection
         with torch.no_grad():
             t_start = timesteps[0]
             t_tensor_start = torch.tensor([int(t_start)], device=x_T_init_batch.device, dtype=torch.long)
             a_t_start = alphas[int(t_start)]
 
-            lat_in = torch.cat([x_T_init_batch] * 2) if do_classifier_free_guidance else x_T_init_batch
-            lat_in = self.pipe.scheduler.scale_model_input(lat_in, t_start)
-            t_in = t_tensor_start.repeat(K * 2) if do_classifier_free_guidance else t_tensor_start.repeat(K)
+            score_chunks = []
+            for start, end in particle_slices(K):
+                x_T_chunk = x_T_init_batch[start:end]
+                cur_p = end - start
 
-            uc_main = un_orig.repeat(K, 1, 1)
-            uc_pool = pooled_un_orig.repeat(K, 1)
-            uc_time = negative_add_time_ids.repeat(K, 1)
-            c_main = cond_emb.repeat(K, 1, 1)
-            c_pool = pooled_cond_emb.repeat(K, 1)
-            c_time = add_time_ids.repeat(K, 1)
+                lat_in = torch.cat([x_T_chunk] * 2) if do_classifier_free_guidance else x_T_chunk
+                lat_in = self.pipe.scheduler.scale_model_input(lat_in, t_start)
+                t_in = t_tensor_start.repeat(cur_p * 2) if do_classifier_free_guidance else t_tensor_start.repeat(cur_p)
 
-            if do_classifier_free_guidance:
-                emb_main = torch.cat([uc_main, c_main])
-                emb_pool = torch.cat([uc_pool, c_pool])
-                emb_time = torch.cat([uc_time, c_time])
-            else:
-                emb_main = c_main
-                emb_pool = c_pool
-                emb_time = c_time
+                uc_main = un_orig.repeat(cur_p, 1, 1)
+                uc_pool = pooled_un_orig.repeat(cur_p, 1)
+                uc_time = negative_add_time_ids.repeat(cur_p, 1)
+                c_main = cond_emb.repeat(cur_p, 1, 1)
+                c_pool = pooled_cond_emb.repeat(cur_p, 1)
+                c_time = add_time_ids.repeat(cur_p, 1)
 
-            noise_pred_start = call_unet_sdxl(lat_in, t_in, emb_main, emb_pool, emb_time)
+                if do_classifier_free_guidance:
+                    emb_main = torch.cat([uc_main, c_main])
+                    emb_pool = torch.cat([uc_pool, c_pool])
+                    emb_time = torch.cat([uc_time, c_time])
+                else:
+                    emb_main = c_main
+                    emb_pool = c_pool
+                    emb_time = c_time
 
-            if do_classifier_free_guidance:
-                noise_pred_uncond_start, noise_pred_text_start = noise_pred_start.chunk(2)
-                eps_cfg_start = noise_pred_uncond_start + self.s * (noise_pred_text_start - noise_pred_uncond_start)
-            else:
-                eps_cfg_start = noise_pred_start
+                noise_pred_start = call_unet_sdxl(lat_in, t_in, emb_main, emb_pool, emb_time)
 
-            x0_hat_start = tweedie_x0_from_eps(x_T_init_batch, eps_cfg_start, a_t_start)
-            imgs_start = decode_images(self.pipe, x0_hat_start)
-            
-            scores_start = reward_fn(imgs_start, [prompt] * K)
-            scores_start[torch.isnan(scores_start)] = -float('inf')
+                if do_classifier_free_guidance:
+                    noise_pred_uncond_start, noise_pred_text_start = noise_pred_start.chunk(2)
+                    eps_cfg_start = noise_pred_uncond_start + self.s * (noise_pred_text_start - noise_pred_uncond_start)
+                else:
+                    eps_cfg_start = noise_pred_start
+
+                x0_hat_start = tweedie_x0_from_eps(x_T_chunk, eps_cfg_start, a_t_start)
+                imgs_start = decode_images(self.pipe, x0_hat_start)
+                scores_chunk = reward_fn(imgs_start, [prompt] * cur_p)
+                scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
+                score_chunks.append(scores_chunk)
+
+            scores_start = torch.cat(score_chunks, dim=0)
 
             _, best_idx_start = torch.max(scores_start, dim=0)
             x_t_particle = x_T_init_batch[best_idx_start:best_idx_start + 1].clone()
@@ -538,42 +557,65 @@ class CFGOptWithBeamSearch:
                 eps_final = u_final + self.s * (c_final - u_final)
 
                 if i < self.T - 1:
-                    x_prev_in = x_t_particle.repeat(K, 1, 1, 1)
-                    eps_in = eps_final.repeat(K, 1, 1, 1)
-                    
                     g_step = torch.Generator(device=self.pipe.device).manual_seed(int(t))
-                    x_tm1 = self.pipe.scheduler.step(eps_in, t, x_prev_in, eta=1.0, generator=g_step).prev_sample
+                    x_tm1_chunks = []
+                    for start, end in particle_slices(K):
+                        cur_p = end - start
+                        x_prev_in = x_t_particle.repeat(cur_p, 1, 1, 1)
+                        eps_in = eps_final.repeat(cur_p, 1, 1, 1)
+                        x_tm1_chunk = self.pipe.scheduler.step(
+                            eps_in, t, x_prev_in, eta=1.0, generator=g_step
+                        ).prev_sample
+                        x_tm1_chunks.append(x_tm1_chunk)
+                    x_tm1 = torch.cat(x_tm1_chunks, dim=0)
 
                     tm1 = timesteps[i+1]
                     a_tm1 = alphas[int(tm1)]
-                    
-                    lat_tm1_in = self.pipe.scheduler.scale_model_input(torch.cat([x_tm1]*2), tm1) 
-                    t_tm1 = torch.tensor([int(tm1)], device=device).repeat(2*K)
-                    
-                    emb_main_tm1 = torch.cat([un_committed.repeat(K,1,1), cond_emb.repeat(K,1,1)])
-                    emb_pool_tm1 = torch.cat([pooled_committed.repeat(K,1), pooled_cond_emb.repeat(K,1)])
-                    emb_time_tm1 = torch.cat([negative_add_time_ids.repeat(K,1), add_time_ids.repeat(K,1)])
 
-                    noise_tm1 = call_unet_sdxl(lat_tm1_in, t_tm1, emb_main_tm1, emb_pool_tm1, emb_time_tm1)
-                    u_tm1, c_tm1 = noise_tm1.chunk(2)
-                    eps_tm1 = u_tm1 + self.s * (c_tm1 - u_tm1)
-                    
-                    x0_hat_tm1 = tweedie_x0_from_eps(x_tm1, eps_tm1, a_tm1)
-                    imgs_tm1 = decode_images(self.pipe, x0_hat_tm1)
-                    scores = reward_fn(imgs_tm1, [prompt]*K)
-                    scores[torch.isnan(scores)] = -float('inf')
+                    score_chunks = []
+                    for start, end in particle_slices(K):
+                        cur_p = end - start
+                        x_tm1_chunk = x_tm1[start:end]
+                        lat_tm1_in = self.pipe.scheduler.scale_model_input(torch.cat([x_tm1_chunk]*2), tm1)
+                        t_tm1 = torch.tensor([int(tm1)], device=device).repeat(2*cur_p)
+
+                        emb_main_tm1 = torch.cat([un_committed.repeat(cur_p,1,1), cond_emb.repeat(cur_p,1,1)])
+                        emb_pool_tm1 = torch.cat([pooled_committed.repeat(cur_p,1), pooled_cond_emb.repeat(cur_p,1)])
+                        emb_time_tm1 = torch.cat([negative_add_time_ids.repeat(cur_p,1), add_time_ids.repeat(cur_p,1)])
+
+                        noise_tm1 = call_unet_sdxl(lat_tm1_in, t_tm1, emb_main_tm1, emb_pool_tm1, emb_time_tm1)
+                        u_tm1, c_tm1 = noise_tm1.chunk(2)
+                        eps_tm1 = u_tm1 + self.s * (c_tm1 - u_tm1)
+
+                        x0_hat_tm1 = tweedie_x0_from_eps(x_tm1_chunk, eps_tm1, a_tm1)
+                        imgs_tm1 = decode_images(self.pipe, x0_hat_tm1)
+                        scores_chunk = reward_fn(imgs_tm1, [prompt]*cur_p)
+                        scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
+                        score_chunks.append(scores_chunk)
+                    scores = torch.cat(score_chunks, dim=0)
 
                     best_idx = torch.argmax(scores)
                     x_t_particle = x_tm1[best_idx:best_idx+1].clone()
                 
                 else:
-                    x_t_in = x_t_particle.repeat(K, 1, 1, 1)
-                    eps_in = eps_final.repeat(K, 1, 1, 1)
                     g_step = torch.Generator(device=self.pipe.device).manual_seed(int(t))
-                    x_final = self.pipe.scheduler.step(eps_in, t, x_t_in, eta=1.0, generator=g_step).prev_sample
-                    
-                    imgs_final = decode_images(self.pipe, x_final)
-                    scores = reward_fn(imgs_final, [prompt]*K)
+                    x_final_chunks = []
+                    score_chunks = []
+                    for start, end in particle_slices(K):
+                        cur_p = end - start
+                        x_t_in = x_t_particle.repeat(cur_p, 1, 1, 1)
+                        eps_in = eps_final.repeat(cur_p, 1, 1, 1)
+                        x_final_chunk = self.pipe.scheduler.step(
+                            eps_in, t, x_t_in, eta=1.0, generator=g_step
+                        ).prev_sample
+
+                        imgs_final = decode_images(self.pipe, x_final_chunk)
+                        scores_chunk = reward_fn(imgs_final, [prompt]*cur_p)
+                        scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
+                        x_final_chunks.append(x_final_chunk)
+                        score_chunks.append(scores_chunk)
+                    x_final = torch.cat(x_final_chunks, dim=0)
+                    scores = torch.cat(score_chunks, dim=0)
                     best_idx = torch.argmax(scores)
                     x_t_particle = x_final[best_idx:best_idx+1].clone()
 
@@ -584,7 +626,7 @@ class CFGOptWithBeamSearch:
 # Single experiment
 # =========================
 def run_single_experiment(
-    lambda_alpha, lambda_beta, lambda_gamma, num_particles, log_dir, pipe,
+    lambda_alpha, lambda_beta, lambda_gamma, num_particles, batch_p, log_dir, pipe,
     target_reward_fn, pickscore_fn, aesthetic_fn, hps_fn, clip_fn, imagereward_fn,
     base_tensors_batch, current_seed, current_prompt, current_negative_prompt,
     min_inner_steps, max_inner_steps, target_reward_name, tampering_coef,
@@ -610,7 +652,7 @@ def run_single_experiment(
     runner = CFGOptWithBeamSearch(
         pipe, guidance_scale, num_inference_steps, lr_uncond,
         min_inner_steps, max_inner_steps, lambda_alpha, lambda_beta, lambda_gamma,
-        num_particles, tampering_coef
+        num_particles, batch_p, tampering_coef
     )
 
     # Optimize
@@ -640,7 +682,7 @@ def run_single_experiment(
 # Main
 # =========================
 def main():
-    global seed, max_inner_steps, min_inner_steps, num_particles, lr_uncond, tampering_coef
+    global seed, max_inner_steps, min_inner_steps, num_particles, batch_p, lr_uncond, tampering_coef
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_reward", type=str, default="pickscore", choices=["pickscore", "aesthetic", "hpsv2", "imagereward"])
@@ -651,6 +693,7 @@ def main():
     parser.add_argument("--min_inner_steps", type=int)
     parser.add_argument("--max_inner_steps", type=int)
     parser.add_argument("--num_particles", type=int)
+    parser.add_argument("--batch_p", type=int)
     parser.add_argument("--lr_uncond", type=float)
     parser.add_argument("--tampering_coef", type=float)
     parser.add_argument("--eval_all_rewards", action="store_true")
@@ -661,8 +704,13 @@ def main():
     if args.min_inner_steps is not None: min_inner_steps = args.min_inner_steps
     if args.max_inner_steps is not None: max_inner_steps = args.max_inner_steps
     if args.num_particles is not None: num_particles = args.num_particles
+    if args.batch_p is not None: batch_p = args.batch_p
     if args.lr_uncond is not None: lr_uncond = args.lr_uncond
     if args.tampering_coef is not None: tampering_coef = args.tampering_coef
+    if batch_p is None:
+        batch_p = num_particles
+    if batch_p < 1 or batch_p > num_particles:
+        raise ValueError("--batch_p must be between 1 and --num_particles")
 
     hp_triples = [(args.lambda_alpha, args.lambda_reg, args.phi_variance)] if args.lambda_alpha else DEFAULT_HYPERPARAM_TRIPLES
 
@@ -752,7 +800,7 @@ def main():
                 base_batch = {"base_img": base_out, "x_T_noise": x_T}
 
                 res = run_single_experiment(
-                    a, b, g, num_particles, log_dir, pipe,
+                    a, b, g, num_particles, batch_p, log_dir, pipe,
                     target_fn, pickscore_fn, aesthetic_fn, hps_fn, clip_fn, imagereward_fn,
                     base_batch, seed, prompt, negative_prompt, min_inner_steps, max_inner_steps, args.target_reward, tampering_coef,
                     p_emb, n_p_emb, pool_p_emb, n_pool_p_emb, add_time_ids, n_add_time_ids

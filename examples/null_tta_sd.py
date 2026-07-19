@@ -82,6 +82,7 @@ negative_prompt = ""
 
 num_samples = 3
 num_particles = 3
+batch_p = None
 num_inference_steps = 100
 guidance_scale = 7.5
 
@@ -305,6 +306,7 @@ class CFGOptWithBeamSearch:
         lambda_beta: float,
         lambda_gamma: float,
         num_beams: int,
+        batch_p: int = None,
         tampering_coef: float = 0.008,
     ):
         self.pipe = pipe
@@ -317,6 +319,11 @@ class CFGOptWithBeamSearch:
         self.lambda_reg = float(lambda_beta)
         self.phi_variance = float(lambda_gamma)
         self.K_samples = int(num_beams)
+        self.batch_p = self.K_samples if batch_p is None else int(batch_p)
+        if self.batch_p < 1:
+            raise ValueError("batch_p must be >= 1")
+        if self.batch_p > self.K_samples:
+            raise ValueError("batch_p must be <= num_particles")
         self.tampering_coef = float(tampering_coef)
 
         for p in self.pipe.unet.parameters():
@@ -372,6 +379,11 @@ class CFGOptWithBeamSearch:
 
         do_classifier_free_guidance = self.s > 1.0
 
+        def particle_slices(total: int):
+            for start in range(0, total, self.batch_p):
+                end = min(start + self.batch_p, total)
+                yield start, end
+
         # initial selection
         with torch.no_grad():
             print(f"v15: Performing initial selection from {K} noise particles at t={timesteps[0]}...")
@@ -380,36 +392,44 @@ class CFGOptWithBeamSearch:
                 t_tensor_start = torch.tensor([int(t_start)], device=x_T_init_batch.device, dtype=torch.long)
                 a_t_start = alphas[int(t_start)]
 
-                un_orig_batch = un_orig.repeat(K, 1, 1)
-                cond_emb_batch = cond_emb.repeat(K, 1, 1)
+                score_chunks = []
+                for start, end in particle_slices(K):
+                    cur_p = end - start
+                    x_T_chunk = x_T_init_batch[start:end]
 
-                latent_model_input_start = torch.cat([x_T_init_batch] * 2) if do_classifier_free_guidance else x_T_init_batch
-                t_tensor_start_unet = (
-                    t_tensor_start.repeat(K * 2) if do_classifier_free_guidance else t_tensor_start.repeat(K)
-                )
+                    un_orig_batch = un_orig.repeat(cur_p, 1, 1)
+                    cond_emb_batch = cond_emb.repeat(cur_p, 1, 1)
 
-                latent_model_input_start = self.pipe.scheduler.scale_model_input(latent_model_input_start, t_start)
-                combined_embeds_start = (
-                    torch.cat([un_orig_batch, cond_emb_batch]) if do_classifier_free_guidance else cond_emb_batch
-                )
+                    latent_model_input_start = torch.cat([x_T_chunk] * 2) if do_classifier_free_guidance else x_T_chunk
+                    t_tensor_start_unet = (
+                        t_tensor_start.repeat(cur_p * 2) if do_classifier_free_guidance else t_tensor_start.repeat(cur_p)
+                    )
 
-                noise_pred_start = self.pipe.unet(
-                    latent_model_input_start,
-                    t_tensor_start_unet,
-                    encoder_hidden_states=combined_embeds_start,
-                    return_dict=False,
-                )[0]
+                    latent_model_input_start = self.pipe.scheduler.scale_model_input(latent_model_input_start, t_start)
+                    combined_embeds_start = (
+                        torch.cat([un_orig_batch, cond_emb_batch]) if do_classifier_free_guidance else cond_emb_batch
+                    )
 
-                if do_classifier_free_guidance:
-                    noise_pred_uncond_start, noise_pred_text_start = noise_pred_start.chunk(2)
-                    eps_cfg_start = noise_pred_uncond_start + self.s * (noise_pred_text_start - noise_pred_uncond_start)
-                else:
-                    eps_cfg_start = noise_pred_start
+                    noise_pred_start = self.pipe.unet(
+                        latent_model_input_start,
+                        t_tensor_start_unet,
+                        encoder_hidden_states=combined_embeds_start,
+                        return_dict=False,
+                    )[0]
 
-                x0_hat_start = tweedie_x0_from_eps(x_T_init_batch, eps_cfg_start, a_t_start)
-                imgs_start = decode_images(self.pipe, x0_hat_start)
-                scores_start = reward_fn(imgs_start, [prompt] * K)
-                scores_start[torch.isnan(scores_start)] = -float('inf')
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond_start, noise_pred_text_start = noise_pred_start.chunk(2)
+                        eps_cfg_start = noise_pred_uncond_start + self.s * (noise_pred_text_start - noise_pred_uncond_start)
+                    else:
+                        eps_cfg_start = noise_pred_start
+
+                    x0_hat_start = tweedie_x0_from_eps(x_T_chunk, eps_cfg_start, a_t_start)
+                    imgs_start = decode_images(self.pipe, x0_hat_start)
+                    scores_chunk = reward_fn(imgs_start, [prompt] * cur_p)
+                    scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
+                    score_chunks.append(scores_chunk)
+
+                scores_start = torch.cat(score_chunks, dim=0)
 
                 _, best_idx_start = torch.max(scores_start, dim=0)
                 x_t_particle = x_T_init_batch[best_idx_start:best_idx_start + 1].clone()
@@ -598,18 +618,22 @@ class CFGOptWithBeamSearch:
                     eps_step_single = noise_pred_final
 
                 if i < self.T - 1:
-                    x_t_to_step = x_t_particle.repeat(self.K_samples, 1, 1, 1)
-                    eps_to_step = eps_step_single.repeat(self.K_samples, 1, 1, 1)
-
                     g_step = torch.Generator(device=self.pipe.device).manual_seed(int(t))
+                    x_tm1_chunks = []
+                    for start, end in particle_slices(self.K_samples):
+                        cur_p = end - start
+                        x_t_to_step = x_t_particle.repeat(cur_p, 1, 1, 1)
+                        eps_to_step = eps_step_single.repeat(cur_p, 1, 1, 1)
 
-                    x_tm1_samples = self.pipe.scheduler.step(
-                        eps_to_step,
-                        t,
-                        x_t_to_step,
-                        eta=1.0,
-                        generator=g_step,
-                    ).prev_sample
+                        x_tm1_chunk = self.pipe.scheduler.step(
+                            eps_to_step,
+                            t,
+                            x_t_to_step,
+                            eta=1.0,
+                            generator=g_step,
+                        ).prev_sample
+                        x_tm1_chunks.append(x_tm1_chunk)
+                    x_tm1_samples = torch.cat(x_tm1_chunks, dim=0)
 
                     try:
                         tm1 = timesteps[i + 1]
@@ -618,47 +642,54 @@ class CFGOptWithBeamSearch:
                         )
                         a_tm1 = alphas[int(tm1)]
 
-                        un_committed_batch = un_committed.repeat(self.K_samples, 1, 1)
-                        cond_emb_batch = cond_emb.repeat(self.K_samples, 1, 1)
+                        score_chunks = []
+                        for start, end in particle_slices(self.K_samples):
+                            cur_p = end - start
+                            x_tm1_chunk = x_tm1_samples[start:end]
 
-                        latent_model_input_tm1 = (
-                            torch.cat([x_tm1_samples] * 2) if do_classifier_free_guidance else x_tm1_samples
-                        )
-                        t_tensor_tm1_unet = (
-                            t_tensor_tm1.repeat(self.K_samples * 2)
-                            if do_classifier_free_guidance
-                            else t_tensor_tm1.repeat(self.K_samples)
-                        )
+                            un_committed_batch = un_committed.repeat(cur_p, 1, 1)
+                            cond_emb_batch = cond_emb.repeat(cur_p, 1, 1)
 
-                        latent_model_input_tm1 = self.pipe.scheduler.scale_model_input(
-                            latent_model_input_tm1, tm1
-                        )
-                        combined_embeds_tm1 = (
-                            torch.cat([un_committed_batch, cond_emb_batch])
-                            if do_classifier_free_guidance
-                            else cond_emb_batch
-                        )
-
-                        noise_pred_tm1 = self.pipe.unet(
-                            latent_model_input_tm1,
-                            t_tensor_tm1_unet,
-                            encoder_hidden_states=combined_embeds_tm1,
-                            return_dict=False,
-                        )[0]
-
-                        if do_classifier_free_guidance:
-                            noise_pred_uncond_tm1, noise_pred_text_tm1 = noise_pred_tm1.chunk(2)
-                            eps_cfg_tm1 = noise_pred_uncond_tm1 + self.s * (
-                                noise_pred_text_tm1 - noise_pred_uncond_tm1
+                            latent_model_input_tm1 = (
+                                torch.cat([x_tm1_chunk] * 2) if do_classifier_free_guidance else x_tm1_chunk
                             )
-                        else:
-                            eps_cfg_tm1 = noise_pred_tm1
+                            t_tensor_tm1_unet = (
+                                t_tensor_tm1.repeat(cur_p * 2)
+                                if do_classifier_free_guidance
+                                else t_tensor_tm1.repeat(cur_p)
+                            )
 
-                        x0_hat_tm1_samples = tweedie_x0_from_eps(x_tm1_samples, eps_cfg_tm1, a_tm1)
-                        imgs_tm1 = decode_images(self.pipe, x0_hat_tm1_samples)
+                            latent_model_input_tm1 = self.pipe.scheduler.scale_model_input(
+                                latent_model_input_tm1, tm1
+                            )
+                            combined_embeds_tm1 = (
+                                torch.cat([un_committed_batch, cond_emb_batch])
+                                if do_classifier_free_guidance
+                                else cond_emb_batch
+                            )
 
-                        scores_tm1 = reward_fn(imgs_tm1, [prompt] * self.K_samples)
-                        scores_tm1[torch.isnan(scores_tm1)] = -float('inf')
+                            noise_pred_tm1 = self.pipe.unet(
+                                latent_model_input_tm1,
+                                t_tensor_tm1_unet,
+                                encoder_hidden_states=combined_embeds_tm1,
+                                return_dict=False,
+                            )[0]
+
+                            if do_classifier_free_guidance:
+                                noise_pred_uncond_tm1, noise_pred_text_tm1 = noise_pred_tm1.chunk(2)
+                                eps_cfg_tm1 = noise_pred_uncond_tm1 + self.s * (
+                                    noise_pred_text_tm1 - noise_pred_uncond_tm1
+                                )
+                            else:
+                                eps_cfg_tm1 = noise_pred_tm1
+
+                            x0_hat_tm1_samples = tweedie_x0_from_eps(x_tm1_chunk, eps_cfg_tm1, a_tm1)
+                            imgs_tm1 = decode_images(self.pipe, x0_hat_tm1_samples)
+
+                            scores_chunk = reward_fn(imgs_tm1, [prompt] * cur_p)
+                            scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
+                            score_chunks.append(scores_chunk)
+                        scores_tm1 = torch.cat(score_chunks, dim=0)
 
                     except Exception as e:
                         print(f"ERROR during evaluation step at t={t_int}: {e}")
@@ -671,21 +702,29 @@ class CFGOptWithBeamSearch:
                     x_t_particle = x_tm1_samples[best_idx:best_idx + 1].clone()
 
                 else:
-                    x_t_to_step = x_t_particle.repeat(self.K_samples, 1, 1, 1)
-                    eps_to_step = eps_step_single.repeat(self.K_samples, 1, 1, 1)
-
                     g_step = torch.Generator(device=self.pipe.device).manual_seed(int(t))
-                    x_tm1_candidates = self.pipe.scheduler.step(
-                        eps_to_step,
-                        t,
-                        x_t_to_step,
-                        eta=1.0,
-                        generator=g_step,
-                    ).prev_sample
+                    x_tm1_chunks = []
+                    score_chunks = []
+                    for start, end in particle_slices(self.K_samples):
+                        cur_p = end - start
+                        x_t_to_step = x_t_particle.repeat(cur_p, 1, 1, 1)
+                        eps_to_step = eps_step_single.repeat(cur_p, 1, 1, 1)
 
-                    imgs_final = decode_images(self.pipe, x_tm1_candidates)
-                    scores = reward_fn(imgs_final, [prompt] * self.K_samples)
-                    scores[torch.isnan(scores)] = -float('inf')
+                        x_tm1_chunk = self.pipe.scheduler.step(
+                            eps_to_step,
+                            t,
+                            x_t_to_step,
+                            eta=1.0,
+                            generator=g_step,
+                        ).prev_sample
+
+                        imgs_final = decode_images(self.pipe, x_tm1_chunk)
+                        scores_chunk = reward_fn(imgs_final, [prompt] * cur_p)
+                        scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
+                        x_tm1_chunks.append(x_tm1_chunk)
+                        score_chunks.append(scores_chunk)
+                    x_tm1_candidates = torch.cat(x_tm1_chunks, dim=0)
+                    scores = torch.cat(score_chunks, dim=0)
                     best_idx = torch.argmax(scores)
                     x_t_particle = x_tm1_candidates[best_idx:best_idx + 1].clone()
 
@@ -702,6 +741,7 @@ def run_single_experiment(
     lambda_beta,
     lambda_gamma,
     num_particles,
+    batch_p,
     log_dir,
     pipe,
     target_reward_fn,
@@ -767,6 +807,7 @@ def run_single_experiment(
         lambda_beta=lambda_beta,
         lambda_gamma=lambda_gamma,
         num_beams=num_particles,
+        batch_p=batch_p,
         tampering_coef=tampering_coef,
     )
 
@@ -776,7 +817,7 @@ def run_single_experiment(
 
     print(
         f"--- Starting optimization (K={num_particles} initial particles,"
-        f" K={num_particles} samples/step, NO_HIST_REG)"
+        f" K={num_particles} samples/step, batch_p={batch_p}, NO_HIST_REG)"
         f" (Opt Target: {target_reward_name}) ---"
     )
 
@@ -867,7 +908,7 @@ def run_single_experiment(
 # Main
 # =========================
 def main():
-    global seed, max_inner_steps, min_inner_steps, num_particles, num_inference_steps, lr_uncond, tampering_coef
+    global seed, max_inner_steps, min_inner_steps, num_particles, batch_p, num_inference_steps, lr_uncond, tampering_coef
 
     parser = argparse.ArgumentParser(
         description="Run Particle Filter Optimization (No Historical Regulation)"
@@ -904,6 +945,11 @@ def main():
         help="Number of particles for particle filter (default: 3)",
     )
     parser.add_argument(
+        "--batch_p",
+        type=int,
+        help="Number of particles to process in parallel (default: num_particles)",
+    )
+    parser.add_argument(
         "--num_inference_steps",
         type=int,
         help="Number of diffusion inference steps (default: 100)",
@@ -931,12 +977,18 @@ def main():
         max_inner_steps = args.max_inner_steps
     if args.num_particles is not None:
         num_particles = args.num_particles
+    if args.batch_p is not None:
+        batch_p = args.batch_p
     if args.num_inference_steps is not None:
         num_inference_steps = args.num_inference_steps
     if args.lr_uncond is not None:
         lr_uncond = args.lr_uncond
     if args.tampering_coef is not None:
         tampering_coef = args.tampering_coef
+    if batch_p is None:
+        batch_p = num_particles
+    if batch_p < 1 or batch_p > num_particles:
+        raise ValueError("--batch_p must be between 1 and --num_particles")
 
     # Set hyperparameter triples (retain original search mode)
     if args.lambda_alpha is not None and args.lambda_reg is not None and args.phi_variance is not None:
@@ -1113,6 +1165,7 @@ def main():
                     lambda_beta=b_val,
                     lambda_gamma=g_val,
                     num_particles=num_particles,
+                    batch_p=batch_p,
                     log_dir=hyperparam_log_dir,
                     pipe=pipe,
                     target_reward_fn=target_reward_fn,
