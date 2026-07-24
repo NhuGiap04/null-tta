@@ -336,7 +336,7 @@ class CFGOptWithBeamSearch:
         # ---
         reward_fn, 
         x_T_init_batch: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
 
         K = self.K_samples
         if x_T_init_batch.shape[0] != K:
@@ -431,6 +431,8 @@ class CFGOptWithBeamSearch:
             x_t_particle = x_T_init_batch[best_idx_start:best_idx_start + 1].clone()
 
 
+        final_particle_images = None
+        final_best_idx = 0
         for i, t in enumerate(tqdm(timesteps, desc="Null-TTA Optimization", leave=False)):
             t_int = int(t)
             t_tensor = torch.tensor([t_int], device=x_t_particle.device, dtype=torch.long)
@@ -600,6 +602,7 @@ class CFGOptWithBeamSearch:
                 else:
                     g_step = torch.Generator(device=self.pipe.device).manual_seed(int(t))
                     x_final_chunks = []
+                    image_chunks = []
                     score_chunks = []
                     for start, end in particle_slices(K):
                         cur_p = end - start
@@ -613,13 +616,18 @@ class CFGOptWithBeamSearch:
                         scores_chunk = reward_fn(imgs_final, [prompt]*cur_p)
                         scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
                         x_final_chunks.append(x_final_chunk)
+                        image_chunks.append(imgs_final)
                         score_chunks.append(scores_chunk)
                     x_final = torch.cat(x_final_chunks, dim=0)
+                    final_particle_images = torch.cat(image_chunks, dim=0)
                     scores = torch.cat(score_chunks, dim=0)
                     best_idx = torch.argmax(scores)
+                    final_best_idx = int(best_idx.item())
                     x_t_particle = x_final[best_idx:best_idx+1].clone()
 
-        return decode_images(self.pipe, x_t_particle)
+        if final_particle_images is None:
+            final_particle_images = decode_images(self.pipe, x_t_particle)
+        return final_particle_images, final_best_idx
 
 
 # =========================
@@ -656,7 +664,7 @@ def run_single_experiment(
     )
 
     # Optimize
-    img_opt_batch = runner.optimize(
+    final_particle_images, best_particle_idx = runner.optimize(
         current_prompt,
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds,
         add_time_ids, negative_add_time_ids,
@@ -667,7 +675,7 @@ def run_single_experiment(
     # Optimized scores
     with torch.no_grad():
         prompts = [current_prompt] * 1
-        best_img = img_opt_batch[0].unsqueeze(0)
+        best_img = final_particle_images[best_particle_idx].unsqueeze(0)
         o_pick = float(pickscore_fn(best_img, prompts).mean().item())
         o_aes = float(aesthetic_fn(best_img, prompts).mean().item())
         o_hps = float(hps_fn(best_img, prompts).mean().item())
@@ -675,7 +683,11 @@ def run_single_experiment(
         o_ir = float(imagereward_fn(best_img, prompts).mean().item())
         print(f"Optimized: Pick={o_pick:.3f}, Aes={o_aes:.3f}, HPS={o_hps:.3f}, CLIP={o_clip:.3f}, IR={o_ir:.3f}")
 
-    return (base_img, best_img.squeeze(0), s_pick, o_pick, s_aes, o_aes, s_hps, o_hps, s_clip, o_clip, s_ir, o_ir)
+    return (
+        base_img, best_img.squeeze(0), s_pick, o_pick, s_aes, o_aes,
+        s_hps, o_hps, s_clip, o_clip, s_ir, o_ir,
+        final_particle_images, best_particle_idx,
+    )
 
 
 # =========================
@@ -774,8 +786,12 @@ def main():
                 gen = set_seed(seed)
                 x_T = make_init_latents(pipe, height, width, num_particles, gen)
 
+                baseline_dir = os.path.join(log_dir, "baseline")
+                null_tta_dir = os.path.join(log_dir, "null-tta")
+                os.makedirs(baseline_dir, exist_ok=True)
+                os.makedirs(null_tta_dir, exist_ok=True)
                 # --- Generate baseline and save immediately ---
-                base_img_path = os.path.join(log_dir, f"{idx}_base.png")
+                base_img_path = os.path.join(baseline_dir, f"{idx}_base.png")
                 with torch.no_grad():
                     base_latent_out_fp16 = pipe(
                         prompt=prompt, 
@@ -808,9 +824,14 @@ def main():
                 
                 writer.writerow([prompt, res[2], res[3], res[4], res[5], res[6], res[7], res[8], res[9], res[10], res[11]])
                 
-                opt_img_path = os.path.join(log_dir, f"{idx}_opt.png")
-                save_image_tensor(res[1], opt_img_path)
-                print(f"Optimized image saved to: {opt_img_path}")
+                for particle_idx, particle_img in enumerate(res[12]):
+                    selected_suffix = "_selected" if particle_idx == res[13] else ""
+                    particle_path = os.path.join(
+                        null_tta_dir,
+                        f"{idx}_particle_{particle_idx:03d}{selected_suffix}.png",
+                    )
+                    save_image_tensor(particle_img, particle_path)
+                print(f"Null-TTA particles saved to: {null_tta_dir}")
 
 if __name__ == "__main__":
     main()

@@ -362,7 +362,7 @@ class CFGOptWithBeamSearch:
         negative_prompt: str,
         reward_fn,  # target reward fn
         x_T_init_batch: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
 
         K = self.K_samples
         if x_T_init_batch.shape[0] != K:
@@ -441,6 +441,8 @@ class CFGOptWithBeamSearch:
                 traceback.print_exc()
                 x_t_particle = x_T_init_batch[0:1].clone()
 
+        final_particle_images = None
+        final_best_idx = 0
         for i, t in enumerate(
             tqdm(
                 timesteps,
@@ -704,6 +706,7 @@ class CFGOptWithBeamSearch:
                 else:
                     g_step = torch.Generator(device=self.pipe.device).manual_seed(int(t))
                     x_tm1_chunks = []
+                    image_chunks = []
                     score_chunks = []
                     for start, end in particle_slices(self.K_samples):
                         cur_p = end - start
@@ -722,15 +725,19 @@ class CFGOptWithBeamSearch:
                         scores_chunk = reward_fn(imgs_final, [prompt] * cur_p)
                         scores_chunk[torch.isnan(scores_chunk)] = -float('inf')
                         x_tm1_chunks.append(x_tm1_chunk)
+                        image_chunks.append(imgs_final)
                         score_chunks.append(scores_chunk)
                     x_tm1_candidates = torch.cat(x_tm1_chunks, dim=0)
+                    final_particle_images = torch.cat(image_chunks, dim=0)
                     scores = torch.cat(score_chunks, dim=0)
                     best_idx = torch.argmax(scores)
+                    final_best_idx = int(best_idx.item())
                     x_t_particle = x_tm1_candidates[best_idx:best_idx + 1].clone()
 
         with torch.no_grad():
-            img_opt_batch = decode_images(self.pipe, x_t_particle)
-        return img_opt_batch
+            if final_particle_images is None:
+                final_particle_images = decode_images(self.pipe, x_t_particle)
+        return final_particle_images, final_best_idx
 
 
 # =========================
@@ -830,7 +837,7 @@ def run_single_experiment(
 
     try:
         print(f"--- [!!] Optimizing using {target_reward_name} as the target reward function [!!] ---")
-        img_opt_batch = runner.optimize(
+        final_particle_images, best_particle_idx = runner.optimize(
             current_prompt,
             current_negative_prompt,
             target_reward_fn,
@@ -838,34 +845,35 @@ def run_single_experiment(
         )
 
         with torch.no_grad():
-            prompt_list_opt = [current_prompt] * img_opt_batch.shape[0]
+            best_img_batch = final_particle_images[best_particle_idx:best_particle_idx + 1]
+            prompt_list_opt = [current_prompt]
 
-            scores_opt_pick_batch = pickscore_fn(img_opt_batch, prompt_list_opt)
+            scores_opt_pick_batch = pickscore_fn(best_img_batch, prompt_list_opt)
             score_opt_pick = float(scores_opt_pick_batch[0].item())
             if np.isnan(score_opt_pick):
                 score_opt_pick = -float("inf")
 
-            scores_opt_aesthetic_batch = aesthetic_fn(img_opt_batch, prompt_list_opt)
+            scores_opt_aesthetic_batch = aesthetic_fn(best_img_batch, prompt_list_opt)
             score_opt_aesthetic = float(scores_opt_aesthetic_batch[0].item())
             if np.isnan(score_opt_aesthetic):
                 score_opt_aesthetic = float("nan")
 
-            scores_opt_hps_batch = hps_fn(img_opt_batch, prompt_list_opt)
+            scores_opt_hps_batch = hps_fn(best_img_batch, prompt_list_opt)
             score_opt_hps = float(scores_opt_hps_batch[0].item())
             if np.isnan(score_opt_hps):
                 score_opt_hps = float("nan")
 
-            scores_opt_clip_batch = clip_fn(img_opt_batch, prompt_list_opt)
+            scores_opt_clip_batch = clip_fn(best_img_batch, prompt_list_opt)
             score_opt_clip = float(scores_opt_clip_batch[0].item())
             if np.isnan(score_opt_clip):
                 score_opt_clip = float("nan")
 
-            scores_opt_imagereward_batch = imagereward_fn(img_opt_batch, prompt_list_opt)
+            scores_opt_imagereward_batch = imagereward_fn(best_img_batch, prompt_list_opt)
             score_opt_imagereward = float(scores_opt_imagereward_batch[0].item())
             if np.isnan(score_opt_imagereward):
                 score_opt_imagereward = float("nan")
 
-        best_img = img_opt_batch[0]
+        best_img = best_img_batch[0]
         # Image saving is handled in main where file naming is standardized
         print(
             f"Final optimized scores: Pick={score_opt_pick:.4f},"
@@ -885,6 +893,8 @@ def run_single_experiment(
         score_opt_clip = float("nan")
         score_opt_imagereward = float("nan")
         best_img = base_img  # fallback
+        final_particle_images = base_img.unsqueeze(0)
+        best_particle_idx = 0
 
     final_best_pick_score = score_opt_pick if score_opt_pick > -float("inf") else float("nan")
 
@@ -901,6 +911,8 @@ def run_single_experiment(
         score_opt_clip,
         score_base_imagereward,
         score_opt_imagereward,
+        final_particle_images,
+        best_particle_idx,
     )
 
 
@@ -1160,6 +1172,8 @@ def main():
                     best_opt_clip_score,
                     base_score_ir,
                     best_opt_ir_score,
+                    final_particle_images,
+                    best_particle_idx,
                 ) = run_single_experiment(
                     lambda_alpha=a_val,
                     lambda_beta=b_val,
@@ -1184,17 +1198,23 @@ def main():
                     tampering_coef=tampering_coef,
                 )
 
-                # Image saving: only base/opt in the same folder
+                baseline_dir = os.path.join(hyperparam_log_dir, "baseline")
+                null_tta_dir = os.path.join(hyperparam_log_dir, "null-tta")
+                os.makedirs(baseline_dir, exist_ok=True)
+                os.makedirs(null_tta_dir, exist_ok=True)
                 base_img_path = os.path.join(
-                    hyperparam_log_dir,
+                    baseline_dir,
                     f"base_prompt_{prompt_idx:03d}_target-{args.target_reward}.png",
                 )
-                opt_img_path = os.path.join(
-                    hyperparam_log_dir,
-                    f"opt_prompt_{prompt_idx:03d}_target-{args.target_reward}.png",
-                )
                 save_image_tensor(base_img, base_img_path)
-                save_image_tensor(opt_img, opt_img_path)
+                for particle_idx, particle_img in enumerate(final_particle_images):
+                    selected_suffix = "_selected" if particle_idx == best_particle_idx else ""
+                    particle_path = os.path.join(
+                        null_tta_dir,
+                        f"prompt_{prompt_idx:03d}_particle_{particle_idx:03d}"
+                        f"{selected_suffix}_target-{args.target_reward}.png",
+                    )
+                    save_image_tensor(particle_img, particle_path)
 
                 writer.writerow(
                     [

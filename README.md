@@ -91,8 +91,9 @@ python examples/null_tta_sdxl.py
 
 Each run typically saves:
 
-- `*_base.png` — Baseline sample
-- `*_opt.png` — Null-TTA optimized sample
+- `baseline/*_base.png` — Final baseline CFG sample
+- `null-tta/*_particle_*.png` — All Null-TTA particles from the last denoising step
+- `null-tta/*_particle_*_selected.png` — The selected particle (included in the full particle set)
 - `results.csv` — Per-prompt scores
 - (Optional) hyperparameter summary CSV
 
@@ -102,8 +103,12 @@ Example directory structure:
 logs_sdxl/
   SDXL_NullTTA_particle_3_tampering_steps_5_to_25_42_target-pickscore/
     A_100_B_0.002_G_0.01/
-      0_base.png
-      0_opt.png
+      baseline/
+        0_base.png
+      null-tta/
+        0_particle_000.png
+        0_particle_001_selected.png
+        0_particle_002.png
       results.csv
 ```
 
